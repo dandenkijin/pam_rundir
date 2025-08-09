@@ -1,0 +1,18 @@
+PAM Rundir Test Results - Fri Aug  8 09:48:45 PM EDT 2025
+2025-08-08 21:48:45 - 🚀 Starting PAM Rundir tests...
+2025-08-08 21:48:45 - Checking if SSH daemon is running...
+2025-08-08 21:48:45 - ✅ SSH daemon is running
+2025-08-08 21:48:45 - \n=== TEST 1: Create test user ===
+2025-08-08 21:48:45 - Removing existing test user...
+2025-08-08 21:48:45 - Creating test user: pamtestuser
+2025-08-08 21:48:45 - ✅ Test user created successfully
+2025-08-08 21:48:45 - \n=== TEST 2: Configure PAM ===
+2025-08-08 21:48:45 - Backing up /etc/pam.d/sshd to /etc/pam.d/sshd.backup
+2025-08-08 21:48:45 - Configuring PAM to use pam_rundir
+2025-08-08 21:48:45 - pam_rundir is already configured in /etc/pam.d/sshd
+2025-08-08 21:48:45 - \n=== TEST 3: Test login and XDG_RUNTIME_DIR ===
+2025-08-08 21:48:45 - Testing SSH login as pamtestuser...
+Warning: Permanently added 'localhost' (ED25519) to the list of known hosts.
+2025-08-08 21:48:45 - ✅ XDG_RUNTIME_DIR is set to: /run/users/1001
+2025-08-08 21:48:45 - \n=== TEST 4: Verify runtime directory exists ===
+2025-08-08 21:48:45 - ❌ Runtime directory does not exist: /run/users/1001

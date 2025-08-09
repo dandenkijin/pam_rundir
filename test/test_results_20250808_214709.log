@@ -1,0 +1,15 @@
+PAM Rundir Test Results - Fri Aug  8 09:47:09 PM EDT 2025
+2025-08-08 21:47:09 - 🚀 Starting PAM Rundir tests...
+2025-08-08 21:47:09 - Checking if SSH daemon is running...
+2025-08-08 21:47:09 - ✅ SSH daemon is running
+2025-08-08 21:47:09 - \n=== TEST 1: Create test user ===
+2025-08-08 21:47:09 - Removing existing test user...
+2025-08-08 21:47:09 - Creating test user: pamtestuser
+2025-08-08 21:47:09 - ✅ Test user created successfully
+2025-08-08 21:47:09 - \n=== TEST 2: Configure PAM ===
+2025-08-08 21:47:09 - Backing up /etc/pam.d/sshd to /etc/pam.d/sshd.backup
+2025-08-08 21:47:09 - Configuring PAM to use pam_rundir
+2025-08-08 21:47:09 - Adding pam_rundir to /etc/pam.d/sshd
+2025-08-08 21:47:09 - \n=== TEST 3: Test login and XDG_RUNTIME_DIR ===
+2025-08-08 21:47:09 - Testing SSH login as pamtestuser...
+2025-08-08 21:47:09 - ❌ sshpass is required for testing. Install it with: sudo apt-get install sshpass

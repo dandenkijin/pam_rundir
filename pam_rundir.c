@@ -24,29 +24,92 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <syslog.h>
 #include <string.h>
 #include <pwd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <unistd.h>
 
+/* PAM headers must be included before any forward declarations */
 #define PAM_SM_SESSION
 #include <security/pam_modules.h>
 #include <security/pam_appl.h>
 
+/* Constants */
+#define MAX_UID_LENGTH 10          /* Maximum length of a 32-bit integer as string */
+#define COUNTER_BUFFER_SIZE 20     /* Should be enough for any 64-bit counter */
+#define MAX_PATH_LEN 4096          /* Maximum path length */
+#define LOCK_RETRIES 5             /* Maximum retries for file locking */
+#define LOCK_RETRY_DELAY 100000    /* Delay between lock retries in microseconds */
+
+/* Forward declarations */
+static void log_error(pam_handle_t *pamh, const char *format, ...);
+static int ensure_parent_dir(pam_handle_t *pamh);
+static int open_and_lock(const char *path, pam_handle_t *pamh);
+static int read_counter(int fd);
+static int write_counter(int fd, int count);
+static void print_filename(char *buf, int uid, int l);
+static int intlen(int n);
+
+/* PAM cleanup function for session data */
+static void cleanup_session_data(pam_handle_t *pamh, void *data, int error_status) {
+    (void)pamh;        /* Unused parameter */
+    (void)error_status; /* Unused parameter */
+    free(data);
+}
+
 #define FLAG_NAME           "pam_rundir_has_counted"
 
+/* Ensure the parent directory for runtime directories exists with proper permissions */
 static int
-ensure_parent_dir (void)
+ensure_parent_dir(pam_handle_t *pamh)
 {
-    int r = 1;
-    mode_t um = umask (S_IWOTH);
-
-    if (mkdir (PARENT_DIR, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0
-            && errno != EEXIST)
-        r = 0;
-    umask (um);
-    return r;
+    struct stat st;
+    mode_t old_umask = umask(S_IWOTH);
+    int ret = 0;
+    
+    /* Try to create the directory if it doesn't exist */
+    if (mkdir(PARENT_DIR, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) != 0) {
+        if (errno != EEXIST) {
+            log_error(pamh, "Failed to create directory %s: %m", PARENT_DIR);
+            goto out;
+        }
+        
+        /* Directory exists, verify it's actually a directory */
+        if (stat(PARENT_DIR, &st) != 0) {
+            log_error(pamh, "Failed to stat %s: %m", PARENT_DIR);
+            goto out;
+        }
+        
+        if (!S_ISDIR(st.st_mode)) {
+            log_error(pamh, "%s exists but is not a directory", PARENT_DIR);
+            goto out;
+        }
+    }
+    
+    /* Set proper ownership (root:root) */
+    if (chown(PARENT_DIR, 0, 0) != 0) {
+        log_error(pamh, "Failed to set ownership of %s: %m", PARENT_DIR);
+        /* Non-fatal, continue */
+    }
+    
+    /* Set secure permissions (rwxr-xr-x) */
+    if (chmod(PARENT_DIR, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0) {
+        log_error(pamh, "Failed to set permissions on %s: %m", PARENT_DIR);
+        /* Non-fatal, continue */
+    }
+    
+    ret = 1; /* Success */
+    
+out:
+    umask(old_umask);
+    return ret;
 }
 
 static int
@@ -79,23 +142,99 @@ print_int (char *s, int n, int l)
     }
 }
 
+/* Log an error message to syslog */
+static void
+log_error(pam_handle_t *pamh, const char *format, ...)
+{
+    (void)pamh;  /* Unused parameter */
+    va_list args;
+    char buf[1024];
+    
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    
+    /* Log to syslog with the PAM module name */
+    openlog("pam_rundir", LOG_PID | LOG_CONS, LOG_AUTHPRIV);
+    syslog(LOG_ERR, "%s", buf);
+    closelog();
+    
+    /* Also log to stderr if running in debug mode */
+#ifdef DEBUG
+    fprintf(stderr, "pam_rundir: %s\n", buf);
+#endif
+}
+
+/* Safely open and lock a file with retries */
 static int
-open_and_lock (const char *file)
+open_and_lock (const char *file, pam_handle_t *pamh)
 {
     int fd;
+    int retries = 0;
+    struct stat st;
 
-    do { fd = open (file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR); }
-    while (fd < 0 && errno == EINTR);
-    if (fd < 0)
-        return fd;
+    /* Ensure parent directory exists */
+    char path[PATH_MAX];
+    char *last_slash = strrchr(file, '/');
+    if (last_slash) {
+        size_t dir_len = last_slash - file;
+        if (dir_len >= PATH_MAX) {
+            if (pamh) log_error(pamh, "Path too long: %.*s", (int)dir_len, file);
+            return -1;
+        }
+        strncpy(path, file, dir_len);
+        path[dir_len] = '\0';
+        
+        if (stat(path, &st) == -1) {
+            if (mkdir(path, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) == -1 && errno != EEXIST) {
+                if (pamh) log_error(pamh, "Failed to create directory %s: %m", path);
+                return -1;
+            }
+        } else if (!S_ISDIR(st.st_mode)) {
+            if (pamh) log_error(pamh, "%s exists but is not a directory", path);
+            return -1;
+        }
+    }
 
-    if (flock (fd, LOCK_EX) < 0)
-    {
-        close (fd);
+    /* Try to open the file with retries */
+    while (retries < LOCK_RETRIES) {
+        fd = open(file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        if (fd >= 0) break;
+        
+        if (errno != EINTR && errno != EAGAIN) {
+            if (pamh) log_error(pamh, "Failed to open %s: %m", file);
+            return -1;
+        }
+        
+        usleep(LOCK_RETRY_DELAY);
+        retries++;
+    }
+    
+    if (fd < 0) {
+        if (pamh) log_error(pamh, "Failed to open %s after %d retries: %m", file, LOCK_RETRIES);
         return -1;
     }
 
-    return fd;
+    /* Try to get an exclusive lock with retries */
+    retries = 0;
+    while (retries < LOCK_RETRIES) {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+            return fd;  /* Success */
+        }
+        
+        if (errno != EWOULDBLOCK && errno != EINTR) {
+            close(fd);
+            if (pamh) log_error(pamh, "Failed to lock %s: %m", file);
+            return -1;
+        }
+        
+        usleep(LOCK_RETRY_DELAY);
+        retries++;
+    }
+    
+    close(fd);
+    if (pamh) log_error(pamh, "Failed to lock %s after %d retries: %m", file, LOCK_RETRIES);
+    return -1;
 }
 
 static inline void
@@ -197,7 +336,7 @@ write_counter (int fd, int count)
             r = write (fd, buf + w, l - w);
             if (r < 0)
             {
-                if (errno = EINTR)
+                if (errno == EINTR)
                     continue;
                 if (w > 0)
                     emergency_invalidate_counter (fd);
@@ -217,214 +356,386 @@ write_counter (int fd, int count)
     return r;
 }
 
+/* Safely remove a directory and its contents */
 static int
-rmrf (const char *path)
+rmrf (const char *path, pam_handle_t *pamh)
 {
     int r = 0;
     DIR *dir;
     struct dirent *dp;
-    int lp;
+    size_t path_len;
+    struct stat st;
 
-    if (unlink (path) == 0)
+    /* First try to unlink the path if it's a file */
+    if (unlink(path) == 0) {
         return 0;
-    else if (errno != EISDIR)
+    } else if (errno != EISDIR) {
+        if (pamh) log_error(pamh, "Failed to unlink %s: %m", path);
         return -1;
+    }
 
-    dir = opendir (path);
-    if (!dir)
+    /* It's a directory, open it */
+    dir = opendir(path);
+    if (!dir) {
+        if (pamh) log_error(pamh, "Failed to open directory %s: %m", path);
         return -1;
-    lp = strlen (path);
-    for (dp = readdir (dir); dp != NULL; dp = readdir (dir))
-    {
-        if (strcmp (dp->d_name, ".") != 0 && strcmp (dp->d_name, "..") != 0)
-        {
-            int l = lp + strlen (dp->d_name) + 2;
-            char name[l];
+    }
 
-            memcpy (name, path, lp);
-            name[lp] = '/';
-            memcpy (name + lp + 1, dp->d_name, l - lp - 1);
+    path_len = strlen(path);
+    if (path_len >= MAX_PATH_LEN - 1) {
+        if (pamh) log_error(pamh, "Path too long: %s", path);
+        closedir(dir);
+        return -1;
+    }
 
-            r += rmrf (name);
+    /* Process directory entries */
+    while ((dp = readdir(dir)) != NULL) {
+        /* Skip . and .. */
+        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+            continue;
+        }
+
+        /* Check if the new path would be too long */
+        size_t name_len = strlen(dp->d_name);
+        if (path_len + 1 + name_len >= MAX_PATH_LEN) {
+            if (pamh) log_error(pamh, "Path too long: %s/%s", path, dp->d_name);
+            r = -1;
+            continue;
+        }
+
+        /* Build full path */
+        char full_path[MAX_PATH_LEN];
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, dp->d_name);
+        
+        /* Get file info */
+        if (stat(full_path, &st) == -1) {
+            if (pamh) log_error(pamh, "Failed to stat %s: %m", full_path);
+            r = -1;
+            continue;
+        }
+
+        /* Handle directory entries */
+        if (S_ISDIR(st.st_mode)) {
+            /* Recursively remove subdirectories */
+            if (rmrf(full_path, pamh) != 0) {
+                r = -1;
+            }
+        } else {
+            /* Remove regular files */
+            if (unlink(full_path) == -1) {
+                if (pamh) log_error(pamh, "Failed to unlink %s: %m", full_path);
+                r = -1;
+            }
         }
     }
-    closedir (dir);
-    if (rmdir (path) < 0)
-        --r;
+    closedir(dir);
+
+    /* Remove the now-empty directory */
+    if (rmdir(path) == -1) {
+        if (pamh) log_error(pamh, "Failed to remove directory %s: %m", path);
+        r = -1;
+    }
 
     return r;
 }
 
 PAM_EXTERN int
-pam_sm_close_session (pam_handle_t *pamh, int flags, int argc, const char **argv)
+pam_sm_close_session(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
+    (void) flags;
+    (void) argc;
+    (void) argv;
     int r;
-    const char *user;
-    struct passwd *pw;
-    int l;
+    const char *user = NULL;
+    struct passwd *pw = NULL;
+    char file[MAX_PATH_LEN];
+    int fd;
+    int count = 0;
+    uid_t uid;
 
-    /* did we add to the counter on open_session (i.e. anything to do) ? */
-    r = pam_get_data (pamh, FLAG_NAME, (const void **) &pw);
-    if (r != PAM_SUCCESS)
-        return (r == PAM_NO_MODULE_DATA) ? PAM_SUCCESS : r;
-
-    if (geteuid() != 0)
+    /* Get the flag we set in open_session */
+    const void *data;
+    r = pam_get_data(pamh, FLAG_NAME, &data);
+    if (r != PAM_SUCCESS && r != PAM_NO_MODULE_DATA) {
+        log_error(pamh, "Failed to get module data: %s", pam_strerror(pamh, r));
         return PAM_SESSION_ERR;
+    }
 
-    if (!ensure_parent_dir ())
+    
+    /* If no data was set, nothing to do */
+    if (r == PAM_NO_MODULE_DATA || data == NULL) {
+        return PAM_SUCCESS;
+    }
+
+    /* Security check: must be root */
+    if (geteuid() != 0) {
+        log_error(pamh, "Must be root to close session");
         return PAM_SESSION_ERR;
+    }
 
-    r = pam_get_user (pamh, &user, NULL);
-    if (r != PAM_SUCCESS)
+    /* Get the username */
+    r = pam_get_user(pamh, &user, NULL);
+    if (r != PAM_SUCCESS || user == NULL || *user == '\0') {
+        log_error(pamh, "Failed to get username: %s", 
+                 r != PAM_SUCCESS ? pam_strerror(pamh, r) : "No username provided");
         return PAM_USER_UNKNOWN;
+    }
 
-    pw = getpwnam (user);
-    if (!pw)
+    /* Get user info */
+    pw = getpwnam(user);
+    if (!pw) {
+        log_error(pamh, "User %s not found in passwd database", user);
         return PAM_USER_UNKNOWN;
+    }
+    uid = pw->pw_uid;
 
-    /* get length for uid as ascii string, i.e. in file/folder name */
-    l = intlen ((int) pw->pw_uid);
+    /* Get length for uid as ascii string */
+    int l = intlen(uid);
+    if (l <= 0 || l > MAX_UID_LENGTH) {
+        log_error(pamh, "Invalid UID length for user %s", user);
+        return PAM_SYSTEM_ERR;
+    }
 
-    {
-        char file[sizeof (PARENT_DIR) + l + 2];
-        int fd;
-        int count = 0;
+    /* Ensure the parent directory exists */
+    if (!ensure_parent_dir(pamh)) {
+        log_error(pamh, "Failed to ensure parent directory exists");
+        return PAM_SESSION_ERR;
+    }
 
-        print_filename (file, (int) pw->pw_uid, l);
-        fd = open_and_lock (file);
-        if (fd < 0)
-            return PAM_SESSION_ERR;
+    /* Construct the counter file path */
+    print_filename(file, uid, l);
 
-        count = read_counter (fd);
-        if (count < 0)
-        {
-            /* -2: dir not usable, but not a failure */
-            r = (count == -2) ? 0 : -1;
-            goto done;
+    /* Open and lock the counter file */
+    fd = open_and_lock(file, pamh);
+    if (fd < 0) {
+        log_error(pamh, "Failed to open/lock counter file %s", file);
+        return PAM_SESSION_ERR;
+    }
+
+    /* Read the current counter value */
+    count = read_counter(fd);
+    if (count < 0) {
+        /* -2 means directory is not usable, but not a failure */
+        r = (count == -2) ? 0 : -1;
+        if (r < 0) {
+            log_error(pamh, "Failed to read counter from %s", file);
         }
+        goto done;
+    }
 
-        /* make sure we don't go below zero, just in case */
-        if (count > 0)
-            --count;
+    /* Decrement counter, ensuring it doesn't go below zero */
+    if (count > 0) {
+        --count;
+    }
 
-        if (count == 0)
-        {
-            /* construct runtime dir name, i.e. remove the dot before uid */
-            memmove (file + sizeof (PARENT_DIR), file + sizeof (PARENT_DIR) + 1, l + 1);
-
-            r = rmrf (file);
-            if (r < 0)
-                count = -1;
+    /* If counter reaches zero, remove the runtime directory */
+    if (count == 0) {
+        /* Construct runtime dir name by removing the dot before UID */
+        memmove(file + sizeof(PARENT_DIR) - 1, file + sizeof(PARENT_DIR), l + 1);
+        
+        if (rmrf(file, pamh) < 0) {
+            log_error(pamh, "Failed to remove directory %s", file);
+            count = -1; /* Mark as error */
         }
+    }
 
-        r = write_counter (fd, count);
-        if (r < 0)
-            goto done;
+    /* Update the counter */
+    r = write_counter(fd, count);
+    if (r < 0) {
+        log_error(pamh, "Failed to update counter in %s", file);
+        goto done;
+    }
 
-        if (count == -1)
-            r = -1;
+    if (count == -1) {
+        r = -1;
+        log_error(pamh, "Error state encountered during directory removal");
+    }
 
 done:
-        close (fd); /* also unlocks */
-    }
+    /* Clean up */
+    close(fd); /* Also releases the lock */
+    
+    /* Clear the module data */
+    pam_set_data(pamh, FLAG_NAME, NULL, NULL);
 
     return (r == 0) ? PAM_SUCCESS : PAM_SESSION_ERR;
 }
 
 PAM_EXTERN int
-pam_sm_open_session (pam_handle_t *pamh, int flags, int argc, const char **argv)
+pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv)
 {
-    int r;
-    const char *user;
-    struct passwd *pw;
+    (void) flags;
+    (void) argc;
+    (void) argv;
+    int r = PAM_SUCCESS;
+    const char *user = NULL;
+    struct passwd *pw = NULL;
+    char file[MAX_PATH_LEN];
+    char env_var[MAX_PATH_LEN + sizeof(VAR_NAME)];
+    int fd = -1;
+    int count = 0;
+    uid_t uid;
+    gid_t gid;
     int l;
 
-    if (geteuid() != 0)
+    /* Security check: must be root */
+    if (geteuid() != 0) {
+        log_error(pamh, "Must be root to open session");
         return PAM_SESSION_ERR;
-
-    if (!ensure_parent_dir ())
-        return PAM_SESSION_ERR;
-
-    r = pam_get_user (pamh, &user, NULL);
-    if (r != PAM_SUCCESS)
-        return PAM_USER_UNKNOWN;
-
-    pw = getpwnam (user);
-    if (!pw)
-        return PAM_USER_UNKNOWN;
-
-    /* get length for uid as ascii string, i.e. in file/folder name */
-    l = intlen ((int) pw->pw_uid);
-
-    {
-        char file[sizeof (PARENT_DIR) + l + 2];
-        int fd;
-        int count = 0;
-
-        print_filename (file, (int) pw->pw_uid, l);
-        fd = open_and_lock (file);
-        if (fd < 0)
-            return PAM_SESSION_ERR;
-
-        count = read_counter (fd);
-        if (count < 0)
-        {
-            /* -2: dir not usable, but not a failure */
-            r = (count == -2) ? 0 : -1;
-            goto done;
-        }
-
-        /* construct runtime dir name, i.e. remove the dot before uid */
-        memmove (file + sizeof (PARENT_DIR), file + sizeof (PARENT_DIR) + 1, l + 1);
-
-        /* update counter now, so we don't have to undo folder creation if
-         * updating the counter fails, etc. Having a count with a failure to
-         * create the folder isn't that big a deal (plus rare enough) to be
-         * worthy of complicating things. */
-        r = write_counter (fd, ++count);
-        if (r < 0)
-            goto done;
-
-        /* flag for processing on close_session */
-        if (pam_set_data (pamh, FLAG_NAME, (void *) 1, NULL) != PAM_SUCCESS)
-        {
-            /* well shit... try to revert, though we can't do nothing if it
-             * fails. A PAM_BUF_ERR (only possible error) should be pretty rare
-             * though (especially combined with a failure to re-write). */
-            write_counter (fd, --count);
-            r = -1;
-            goto done;
-        }
-
-        /* set euid so if we do create the dir, it is own by the user */
-        if (seteuid (pw->pw_uid) < 0)
-        {
-            r = -1;
-            goto done;
-        }
-        if (mkdir (file, S_IRWXU) == 0 || errno == EEXIST)
-        {
-            l = strlen (file);
-            char buf[sizeof (VAR_NAME) + 1 + l];
-
-            memcpy (buf, VAR_NAME, sizeof (VAR_NAME) - 1);
-            buf[sizeof (VAR_NAME) - 1] = '=';
-            memcpy (buf + sizeof (VAR_NAME), file, l + 1);
-
-            pam_putenv (pamh, buf);
-        }
-        /* restore */
-        if (seteuid (0) < 0)
-        {
-            r = -1;
-            goto done;
-        }
-
-done:
-        close (fd); /* also unlocks */
     }
 
-    return (r == 0) ? PAM_SUCCESS : PAM_SESSION_ERR;
+    /* Get the username */
+    r = pam_get_user(pamh, &user, NULL);
+    if (r != PAM_SUCCESS || user == NULL || *user == '\0') {
+        log_error(pamh, "Failed to get username: %s", 
+                 r != PAM_SUCCESS ? pam_strerror(pamh, r) : "No username provided");
+        return PAM_USER_UNKNOWN;
+    }
+
+    /* Get user info */
+    pw = getpwnam(user);
+    if (!pw) {
+        log_error(pamh, "User %s not found in passwd database", user);
+        return PAM_USER_UNKNOWN;
+    }
+    uid = pw->pw_uid;
+    gid = pw->pw_gid;
+
+    /* Get length for uid as ascii string */
+    l = intlen(uid);
+    if (l <= 0 || l > MAX_UID_LENGTH) {
+        log_error(pamh, "Invalid UID length for user %s", user);
+        return PAM_SYSTEM_ERR;
+    }
+
+    /* Ensure the parent directory exists */
+    if (!ensure_parent_dir(pamh)) {
+        log_error(pamh, "Failed to ensure parent directory exists");
+        return PAM_SESSION_ERR;
+    }
+
+    /* Construct the counter file path */
+    print_filename(file, uid, l);
+
+    /* Open and lock the counter file */
+    fd = open_and_lock(file, pamh);
+    if (fd < 0) {
+        log_error(pamh, "Failed to open/lock counter file %s", file);
+        return PAM_SESSION_ERR;
+    }
+
+    /* Read the current counter value */
+    count = read_counter(fd);
+    if (count < 0) {
+        /* -2 means directory is not usable, but not a failure */
+        if (count != -2) {
+            log_error(pamh, "Failed to read counter from %s", file);
+            r = PAM_SESSION_ERR;
+            goto done;
+        }
+        count = 0; /* Start fresh if directory was not usable */
+    }
+
+    /* Construct runtime dir name by removing the dot before UID */
+    char runtime_dir[MAX_PATH_LEN];
+    strncpy(runtime_dir, file, sizeof(runtime_dir) - 1);
+    runtime_dir[sizeof(runtime_dir) - 1] = '\0';
+    memmove(runtime_dir + sizeof(PARENT_DIR) - 1, 
+            runtime_dir + sizeof(PARENT_DIR), 
+            l + 1);
+
+    /* Increment the counter first to maintain consistency */
+    r = write_counter(fd, count + 1);
+    if (r < 0) {
+        log_error(pamh, "Failed to update counter in %s", file);
+        goto done;
+    }
+
+    /* Flag for processing on close_session */
+    int *session_data = malloc(sizeof(int));
+    if (!session_data) {
+        log_error(pamh, "Memory allocation failed");
+        r = PAM_BUF_ERR;
+        goto revert_counter;
+    }
+    *session_data = 1;
+
+    /* Set the module data to indicate we've incremented the counter */
+    r = pam_set_data(pamh, FLAG_NAME, session_data, cleanup_session_data);
+    if (r != PAM_SUCCESS) {
+        log_error(pamh, "Failed to set module data: %s", pam_strerror(pamh, r));
+        free(session_data);
+        goto revert_counter;
+    }
+
+    /* Set effective UID/GID to the user's for directory creation */
+    if (setegid(gid) < 0 || seteuid(uid) < 0) {
+        log_error(pamh, "Failed to set effective UID/GID for user %s", user);
+        r = PAM_SESSION_ERR;
+        goto revert_counter;
+    }
+
+    /* Create the runtime directory if it doesn't exist */
+    if (mkdir(runtime_dir, S_IRWXU) != 0 && errno != EEXIST) {
+        log_error(pamh, "Failed to create directory %s: %m", runtime_dir);
+        r = PAM_SESSION_ERR;
+        goto restore_privs;
+    }
+
+    /* Set the runtime directory in the environment */
+    snprintf(env_var, sizeof(env_var), "%s=%s", VAR_NAME, runtime_dir);
+    r = pam_putenv(pamh, env_var);
+    if (r != PAM_SUCCESS) {
+        log_error(pamh, "Failed to set %s environment variable", VAR_NAME);
+        r = PAM_SESSION_ERR;
+        goto restore_privs;
+    }
+
+    /* Set proper ownership of the directory */
+    if (chown(runtime_dir, uid, gid) < 0) {
+        log_error(pamh, "Failed to set ownership of %s: %m", runtime_dir);
+        /* Non-fatal error, continue */
+    }
+
+    /* Set proper permissions (user rwx only) */
+    if (chmod(runtime_dir, S_IRWXU) < 0) {
+        log_error(pamh, "Failed to set permissions on %s: %m", runtime_dir);
+        /* Non-fatal error, continue */
+    }
+
+    /* Success path */
+    r = PAM_SUCCESS;
+    goto done;
+
+restore_privs:
+    /* Restore root privileges */
+    if (seteuid(0) < 0 || setegid(0) < 0) {
+        log_error(pamh, "FATAL: Failed to restore root privileges");
+        /* Continue anyway */
+    }
+
+revert_counter:
+    /* If we incremented the counter but failed afterward, decrement it */
+    if (count >= 0) {
+        if (write_counter(fd, count) < 0) {
+            log_error(pamh, "Failed to revert counter in %s", file);
+            /* Continue anyway */
+        }
+    }
+    r = PAM_SESSION_ERR;
+
+    /* If we set the module data but failed afterward, clear it */
+    if (r != PAM_SUCCESS) {
+        pam_set_data(pamh, FLAG_NAME, NULL, NULL);
+    }
+
+done:
+    /* Close the file descriptor (also releases the lock) */
+    if (fd >= 0) {
+        close(fd);
+    }
+
+    return r;
 }
 
 #ifdef PAM_STATIC

@@ -1,0 +1,7 @@
+PAM Rundir Test Results - Fri Aug  8 09:46:08 PM EDT 2025
+2025-08-08 21:46:08 - 🚀 Starting PAM Rundir tests...
+2025-08-08 21:46:08 - Checking if SSH daemon is running...
+2025-08-08 21:46:08 - ✅ SSH daemon is running
+2025-08-08 21:46:08 - \n=== TEST 1: Create test user ===
+2025-08-08 21:46:08 - Creating test user: pamtestuser
+2025-08-08 21:46:09 - ✅ Test user created successfully
